@@ -1,0 +1,11 @@
+[project]
+name = "python-agent-sandbox"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "docker>=7.1.0",
+    "fastapi[all]>=0.115.12",
+    "uvicorn>=0.34.1",
+]
