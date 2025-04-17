@@ -1,5 +1,5 @@
-# main.py - FastAPI application for executing Python chart code in Docker
-# Updated: Fixed temporary directory cleanup using BackgroundTasks
+# main.py - FastAPI application for executing Python/Shell code in Docker
+# Updated: Removed unsupported 'cpus' argument from docker run
 
 import os
 import uuid
@@ -7,19 +7,21 @@ import shutil
 import tempfile
 import logging
 from pathlib import Path
+import time # For potential timeouts if needed directly
 
 import docker
 from docker.errors import ContainerError, ImageNotFound, APIError
-# Import BackgroundTasks
+from requests.exceptions import ReadTimeout # Specific timeout exception from docker-py's wait()
 from fastapi import FastAPI, HTTPException, status, BackgroundTasks
-from fastapi.responses import FileResponse # Used to send the image file back
-from pydantic import BaseModel, Field # For request body validation
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 
 # --- Configuration ---
 SANDBOX_IMAGE_NAME = os.getenv("SANDBOX_IMAGE_NAME", "python-chart-sandbox:latest")
-DOCKER_TIMEOUT = int(os.getenv("DOCKER_TIMEOUT", 60)) # Max execution time in seconds
-OUTPUT_FILENAME = "output.png" # Expected output chart filename
-WORKSPACE_DIR_INSIDE_CONTAINER = "/workspace" # Must match WORKDIR in Dockerfile if used
+# Timeout for waiting for container to finish execution
+CONTAINER_RUN_TIMEOUT = int(os.getenv("CONTAINER_RUN_TIMEOUT", 60))
+OUTPUT_FILENAME = "output.png" # Expected output chart filename for chart endpoint
+WORKSPACE_DIR_INSIDE_CONTAINER = "/workspace"
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -29,11 +31,21 @@ logger = logging.getLogger(__name__)
 class PythonCode(BaseModel):
     code: str = Field(..., description="Python code string to execute for generating a chart.")
 
+# New models for Shell execution
+class ShellCommand(BaseModel):
+    command: str = Field(..., description="Shell command string to execute.")
+    # Future: Add workdir, env_vars etc.
+
+class ShellResult(BaseModel):
+    stdout: str
+    stderr: str
+    exit_code: int
+
 # --- FastAPI App Initialization ---
 app = FastAPI(
-    title="Python Chart Execution Service",
-    description="API to execute Python plotting code in a Docker sandbox.",
-    version="0.1.1", # Incremented version
+    title="Code Execution Service",
+    description="API to execute Python chart code and Shell commands in a Docker sandbox.",
+    version="0.2.1", # Incremented version
 )
 
 # --- Docker Client Initialization ---
@@ -46,6 +58,119 @@ except Exception as e:
     docker_client = None
 
 # --- Helper Functions ---
+
+# Refactored Docker Execution Logic
+async def run_in_container(
+    command: list[str],
+    image: str = SANDBOX_IMAGE_NAME,
+    working_dir: str = WORKSPACE_DIR_INSIDE_CONTAINER,
+    volumes: dict = None,
+    timeout: int = CONTAINER_RUN_TIMEOUT,
+    network_mode: str = "none", # Default to no network for security
+    mem_limit: str = "256m" # Keep mem_limit
+    # cpus: float = 1.0 # Removed unsupported cpus parameter
+) -> tuple[int, str, str]:
+    """
+    Runs a command in a temporary Docker container and returns exit code, stdout, stderr.
+
+    Args:
+        command: The command and arguments to run as a list of strings.
+        image: The Docker image to use.
+        working_dir: The working directory inside the container.
+        volumes: A dictionary defining volume mounts (host_path: {bind: container_path, mode: 'rw'/'ro'}).
+        timeout: Maximum time in seconds to wait for the container to finish.
+        network_mode: Docker network mode (e.g., 'none', 'bridge').
+        mem_limit: Memory limit (e.g., "256m").
+        # cpus: CPU limit (e.g., 1.0) - This parameter is NOT directly supported by docker-py run.
+               Use cpu_quota/cpu_period if needed.
+
+    Returns:
+        A tuple containing (exit_code, stdout_string, stderr_string).
+        exit_code is -1 if status couldn't be retrieved (e.g., timeout before wait).
+    """
+    if not docker_client:
+        raise HTTPException(status_code=500, detail="Docker client not available")
+
+    container_name = f"sandbox-helper-{uuid.uuid4()}"
+    container = None
+    exit_code = -1
+    stdout_str = ""
+    stderr_str = ""
+
+    try:
+        logger.info(f"Running command in container '{container_name}': {command}")
+        container = docker_client.containers.run(
+            image=image,
+            command=command,
+            volumes=volumes,
+            name=container_name,
+            working_dir=working_dir,
+            remove=False,       # Set remove=False, we'll remove manually in finally
+            detach=True,        # Detach to run in background and wait later
+            stdout=True,        # Capture stdout
+            stderr=True,        # Capture stderr
+            network_mode=network_mode,
+            mem_limit=mem_limit
+            # cpus=cpus, # <--- REMOVED THIS LINE
+        )
+
+        # Wait for container completion and get status code
+        try:
+            logger.info(f"Waiting for container '{container_name}' to finish (timeout: {timeout}s)...")
+            result = container.wait(timeout=timeout)
+            exit_code = result.get('StatusCode', -1)
+            logger.info(f"Container '{container_name}' finished with exit code: {exit_code}")
+        except (ReadTimeout, ConnectionError) as e: # docker-py wait() raises requests.exceptions.ReadTimeout
+            logger.error(f"Timeout ({timeout}s) waiting for container '{container_name}'. Forcing removal.", exc_info=True)
+            # Exit code remains -1 or its default
+            raise HTTPException(
+                status_code=status.HTTP_408_REQUEST_TIMEOUT,
+                detail=f"Container execution timed out after {timeout} seconds."
+            )
+        except APIError as e:
+             logger.error(f"APIError while waiting for container '{container_name}': {e}", exc_info=True)
+             # Exit code remains -1
+             # Allow finally block to attempt removal
+
+        # Retrieve logs after waiting
+        try:
+            stdout_bytes = container.logs(stdout=True, stderr=False)
+            stderr_bytes = container.logs(stdout=False, stderr=True)
+            stdout_str = stdout_bytes.decode('utf-8', errors='replace') if stdout_bytes else ""
+            stderr_str = stderr_bytes.decode('utf-8', errors='replace') if stderr_bytes else ""
+            logger.info(f"Retrieved logs for container '{container_name}'.")
+        except APIError as e:
+             logger.error(f"APIError retrieving logs for container '{container_name}': {e}", exc_info=True)
+             # Keep logs empty, but we might have the exit code
+
+        return exit_code, stdout_str, stderr_str
+
+    except ImageNotFound:
+        logger.error(f"Fatal: Sandbox image '{image}' not found.")
+        raise HTTPException(status_code=500, detail=f"Execution environment image '{image}' not found.")
+    except APIError as e:
+        logger.error(f"Docker API error during container run for '{container_name}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Docker API error: {e}")
+    except TypeError as e: # Specifically catch TypeError which indicates wrong arguments
+         logger.error(f"TypeError calling docker_client.containers.run for '{container_name}': {e}", exc_info=True)
+         raise HTTPException(status_code=500, detail=f"Server configuration error: Invalid argument passed to Docker run.")
+    except Exception as e: # Catch other unexpected errors
+        logger.error(f"Unexpected error during container execution '{container_name}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"An unexpected server error occurred.")
+    finally:
+        # Ensure container is removed
+        if container:
+            try:
+                logger.info(f"Attempting to remove container '{container.name}'...")
+                container.remove(force=True) # Force remove in case it timed out or errored
+                logger.info(f"Successfully removed container '{container.name}'.")
+            except APIError as e:
+                # Log error but don't raise exception from finally block
+                logger.error(f"Failed to remove container '{container.name}': {e}", exc_info=True)
+            except Exception as e:
+                 logger.error(f"Unexpected error removing container '{container.name}': {e}", exc_info=True)
+
+
 def create_execution_script(user_code: str, output_filename: str, workdir: str) -> str:
     """
     Wraps the user's Python code with necessary boilerplate for execution
@@ -89,7 +214,6 @@ sys.exit(0)
 """
     return boilerplate_header + indented_user_code + boilerplate_footer
 
-# --- Cleanup Function ---
 def cleanup_temp_dir(temp_dir_path: Path):
     """Safely removes the temporary directory."""
     try:
@@ -103,147 +227,82 @@ def cleanup_temp_dir(temp_dir_path: Path):
 
 
 # --- API Endpoints ---
-# Add BackgroundTasks to the function signature
+
 @app.post(
     "/execute/python/chart",
-    responses={
-        200: {
-            "content": {"image/png": {}},
-            "description": "Successful execution. Returns the generated chart as a PNG image.",
-        },
-        400: {"description": "Bad Request (e.g., code execution failed due to user error)."},
-        422: {"description": "Validation Error (Input JSON doesn't match expected format)."},
-        500: {"description": "Internal Server Error (Docker issues, file system errors, etc.)."},
+    responses={ # Keep responses documentation updated
+        200: {"content": {"image/png": {}}, "description": "Success. Returns chart PNG."},
+        400: {"description": "Bad Request (e.g., Python code execution failed)."},
+        408: {"description": "Request Timeout (Container execution took too long)."},
+        422: {"description": "Validation Error."},
+        500: {"description": "Internal Server Error (Docker issues, etc.)."},
     }
 )
-async def execute_python_chart(payload: PythonCode, background_tasks: BackgroundTasks): # Added background_tasks
+async def execute_python_chart(payload: PythonCode, background_tasks: BackgroundTasks):
     """
-    Accepts Python code, executes it in a sandboxed Docker container,
-    and returns the generated Matplotlib chart as a PNG image.
-    Uses background tasks for cleanup.
+    Executes Python code designed to generate a Matplotlib chart in a Docker sandbox.
+    Returns the chart PNG or an error. Uses background tasks for cleanup.
     """
-    if not docker_client:
-        logger.error("API call failed: Docker client is not available.")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Docker client is not available. Cannot execute code.",
-        )
-
-    # 1. Create temporary directory MANUALLY instead of using 'with'
     temp_dir_host = tempfile.mkdtemp()
     temp_dir_path = Path(temp_dir_host)
-    logger.info(f"Created temporary directory for execution: {temp_dir_host}")
+    logger.info(f"Chart Execution: Created temporary directory: {temp_dir_host}")
 
-    # Ensure cleanup happens even if errors occur before returning FileResponse
     try:
         script_filename = "script.py"
         script_path_host = temp_dir_path / script_filename
         output_path_host = temp_dir_path / OUTPUT_FILENAME
-        container_name = f"sandbox-container-{uuid.uuid4()}"
 
-        # 2. Prepare the Python script
+        # Prepare the script
         full_script_code = create_execution_script(
-            payload.code,
-            OUTPUT_FILENAME,
-            WORKSPACE_DIR_INSIDE_CONTAINER
+            payload.code, OUTPUT_FILENAME, WORKSPACE_DIR_INSIDE_CONTAINER
         )
         try:
             script_path_host.write_text(full_script_code)
-            logger.info(f"Execution script written to: {script_path_host}")
+            logger.info(f"Chart Execution: Script written to: {script_path_host}")
         except IOError as e:
-             logger.error(f"Failed to write script file '{script_path_host}': {e}", exc_info=True)
-             raise HTTPException(
-                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                 detail=f"Server error: Failed to write script file."
-             )
+             logger.error(f"Chart Execution: Failed to write script file '{script_path_host}': {e}", exc_info=True)
+             background_tasks.add_task(cleanup_temp_dir, temp_dir_path)
+             raise HTTPException(status_code=500, detail="Server error: Failed to write script file.")
 
-        # 3. Execute the script inside a Docker container
-        container_logs = ""
-        container_exit_code = -1
-        try:
-            logger.info(f"Attempting to run container '{container_name}' from image '{SANDBOX_IMAGE_NAME}'...")
-            logger.info(f"Host temporary directory resolved path: {temp_dir_path.resolve()}")
-            logger.info(f"Mounting host path to '{WORKSPACE_DIR_INSIDE_CONTAINER}' in container.")
+        volumes = {
+            str(temp_dir_path.resolve()): {
+                'bind': WORKSPACE_DIR_INSIDE_CONTAINER,
+                'mode': 'rw'
+            }
+        }
+        command = ["python", f"{WORKSPACE_DIR_INSIDE_CONTAINER}/{script_filename}"]
 
-            container = docker_client.containers.run(
-                image=SANDBOX_IMAGE_NAME,
-                command=["python", f"{WORKSPACE_DIR_INSIDE_CONTAINER}/{script_filename}"],
-                volumes={
-                    str(temp_dir_path.resolve()): {
-                        'bind': WORKSPACE_DIR_INSIDE_CONTAINER,
-                        'mode': 'rw'
-                    }
-                },
-                name=container_name,
-                working_dir=WORKSPACE_DIR_INSIDE_CONTAINER,
-                remove=True,
-                detach=False,
-                stdout=True,
-                stderr=True,
-                # Add resource limits here if needed
-            )
-            container_logs = container.decode('utf-8', errors='replace')
-            container_exit_code = 0
-            logger.info(f"Container '{container_name}' finished successfully (assumed exit code 0).")
+        # Use the refactored helper function to run the container
+        exit_code, stdout_str, stderr_str = await run_in_container(
+            command=command,
+            volumes=volumes,
+            # network_mode="bridge" # Keep default 'none' unless needed
+        )
 
-        except ContainerError as e:
-            container_exit_code = e.exit_status
-            stdout_logs = e.stdout.decode('utf-8', errors='replace') if e.stdout else "[No stdout]"
-            stderr_logs = e.stderr.decode('utf-8', errors='replace') if e.stderr else "[No stderr]"
-            container_logs = f"STDOUT:\n{stdout_logs}\nSTDERR:\n{stderr_logs}"
-            logger.warning(f"Container '{container_name}' exited with error code {container_exit_code}.")
+        logger.info(f"Chart Execution: Container stdout:\n{stdout_str}")
+        if stderr_str:
+            logger.warning(f"Chart Execution: Container stderr:\n{stderr_str}")
 
-        except ImageNotFound:
-            logger.error(f"Fatal: Sandbox image '{SANDBOX_IMAGE_NAME}' not found.")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Execution environment image '{SANDBOX_IMAGE_NAME}' not found on the host."
-            )
-        except APIError as e:
-            logger.error(f"Docker API error during container execution: {e}", exc_info=True)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Docker API error: {e}"
-            )
-        except Exception as e:
-            logger.error(f"Unexpected error during Docker execution: {e}", exc_info=True)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"An unexpected server error occurred during execution."
-            )
-        finally:
-            # Log container output regardless of success or failure
-            if container_logs:
-                 logger.info(f"--- Container Logs ('{container_name}') ---")
-                 for line in container_logs.splitlines():
-                     logger.info(f"  [Container] {line}")
-                 logger.info(f"--- End Container Logs ---")
-            else:
-                 logger.info(f"No logs captured from container '{container_name}'.")
-            logger.info(f"Container '{container_name}' final determined exit code: {container_exit_code}")
+        if exit_code != 0:
+            logger.error(f"Chart Execution: Script failed with exit code {exit_code}.")
+            error_detail = f"Python script execution failed (Exit Code: {exit_code})."
+            log_preview = '\n'.join(stderr_str.splitlines()[-10:])
+            error_detail += f"\nStderr (Last 10 lines):\n{log_preview}"
+            background_tasks.add_task(cleanup_temp_dir, temp_dir_path)
+            raise HTTPException(status_code=400, detail=error_detail)
 
-
-        # 4. Check if the output file was created and handle execution errors
-        logger.info(f"Checking for output file at host path: {output_path_host}")
+        logger.info(f"Chart Execution: Checking for output file at host path: {output_path_host}")
         if not output_path_host.is_file():
-            logger.error(f"Output file '{output_path_host}' not found after execution.")
-            error_detail = f"Code executed but failed to produce the expected output file ('{OUTPUT_FILENAME}')."
-            if container_exit_code != 0:
-                error_detail += f"\nContainer Exit Code: {container_exit_code}"
-                if container_logs:
-                    log_preview = '\n'.join(container_logs.splitlines()[-20:])
-                    error_detail += f"\nExecution Logs (Last 20 lines):\n{log_preview}"
-                else:
-                    error_detail += "\nNo execution logs captured."
-            status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
-            if container_exit_code != 0:
-                status_code = status.HTTP_400_BAD_REQUEST
-            # No FileResponse to return, raise exception now
-            raise HTTPException(status_code=status_code, detail=error_detail)
+            logger.error(f"Chart Execution: Output file '{output_path_host}' not found despite exit code 0.")
+            error_detail = f"Script executed successfully (Exit Code: 0) but failed to produce the expected output file ('{OUTPUT_FILENAME}'). Check script logic."
+            log_preview_stdout = '\n'.join(stdout_str.splitlines()[-10:])
+            log_preview_stderr = '\n'.join(stderr_str.splitlines()[-10:])
+            error_detail += f"\nStdout (Last 10 lines):\n{log_preview_stdout}"
+            error_detail += f"\nStderr (Last 10 lines):\n{log_preview_stderr}"
+            background_tasks.add_task(cleanup_temp_dir, temp_dir_path)
+            raise HTTPException(status_code=500, detail=error_detail)
 
-        # 5. Return the image file AND schedule cleanup
-        logger.info(f"Execution successful. Returning output file: {output_path_host}")
-        # Add the cleanup task to run AFTER the response is sent
+        logger.info(f"Chart Execution: Success. Returning output file: {output_path_host}")
         background_tasks.add_task(cleanup_temp_dir, temp_dir_path)
         return FileResponse(
             path=output_path_host,
@@ -251,14 +310,65 @@ async def execute_python_chart(payload: PythonCode, background_tasks: Background
             filename=OUTPUT_FILENAME
         )
 
+    except HTTPException:
+         logger.warning(f"Chart Execution: Handling HTTPException, ensuring cleanup for {temp_dir_path}")
+         background_tasks.add_task(cleanup_temp_dir, temp_dir_path)
+         raise
     except Exception as e:
-        # Catch any unexpected errors outside the Docker execution block
-        # Ensure cleanup is still scheduled if temp_dir_path was created
-        if 'temp_dir_path' in locals() and temp_dir_path.is_dir():
-             logger.warning(f"Scheduling cleanup for {temp_dir_path} after unexpected error.")
-             background_tasks.add_task(cleanup_temp_dir, temp_dir_path)
-        # Re-raise the exception to let FastAPI handle it (usually results in 500)
+        logger.error(f"Chart Execution: Unexpected error in endpoint: {e}", exc_info=True)
+        background_tasks.add_task(cleanup_temp_dir, temp_dir_path)
+        raise HTTPException(status_code=500, detail=f"An unexpected server error occurred: {e}")
+
+
+# NEW Shell Execution Endpoint
+@app.post(
+    "/execute/shell",
+    response_model=ShellResult,
+    responses={
+        200: {"description": "Command executed. Returns stdout, stderr, and exit code."},
+        400: {"description": "Bad Request (e.g., invalid shell command leading to non-zero exit)."},
+        408: {"description": "Request Timeout (Container execution took too long)."},
+        422: {"description": "Validation Error."},
+        500: {"description": "Internal Server Error (Docker issues, etc.)."},
+    }
+)
+async def execute_shell_command(payload: ShellCommand):
+    """
+    Executes a shell command string in a Docker sandbox.
+    Returns the command's stdout, stderr, and exit code.
+    """
+    if not payload.command:
+        raise HTTPException(status_code=422, detail="Shell command cannot be empty.")
+
+    shell_command_list = ["bash", "-c", f"set -e; set -o pipefail; {payload.command}"]
+
+    try:
+        # Use the refactored helper function
+        exit_code, stdout_str, stderr_str = await run_in_container(
+            command=shell_command_list,
+            network_mode="bridge", # Keep network enabled for shell examples like curl
+        )
+
+        logger.info(f"Shell Execution: Command '{payload.command}' finished with exit code {exit_code}.")
+        logger.info(f"Shell Execution: stdout:\n{stdout_str}")
+        if stderr_str:
+             logger.warning(f"Shell Execution: stderr:\n{stderr_str}")
+
+        # Return the results using the Pydantic model
+        # Note: Even if exit_code is non-zero, we return 200 OK here.
+        # The caller (the agent) is responsible for interpreting the exit code.
+        # We only raise 4xx/5xx for *infrastructure* or *request validation* errors.
+        return ShellResult(
+            stdout=stdout_str,
+            stderr=stderr_str,
+            exit_code=exit_code
+        )
+    except HTTPException as e:
+        logger.error(f"Shell Execution: HTTPException occurred: {e.detail}")
         raise e
+    except Exception as e:
+        logger.error(f"Shell Execution: Unexpected error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"An unexpected server error occurred: {e}")
 
 
 @app.get("/health", status_code=status.HTTP_200_OK)
@@ -278,4 +388,6 @@ async def health_check():
 if __name__ == "__main__":
     import uvicorn
     logger.info("Starting Uvicorn server directly...")
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True) # Added reload=True here too
+    # Remember to use src.main:app if main.py is in src directory
+    uvicorn.run("main:app", host="0.0.0.0", port=8002, reload=True)
+
