@@ -260,7 +260,12 @@ if __name__ == "__main__":
     print(f"\n--- Running Agent with Query ---\n{user_query}\n-------------------------------\n")
     try:
         result = agent_executor.invoke({"input": user_query})
-        print("\n--- Agent Result ---"); print(result.get("output", "No output field found.")); print("--------------------\n")
+        print("\n--- Agent Result ---"); print(result.get("output", "No output field found.")); 
+        print("--------------------\n")
     except Exception as e:
-        print(f"\n--- Agent Execution Error ---"); print(f"An error occurred: {type(e).__name__} - {e}"); import traceback; traceback.print_exc(); print("---------------------------\n")
+        print("\n--- Agent Execution Error ---"); 
+        print(f"An error occurred: {type(e).__name__} - {e}"); 
+        import traceback; 
+        traceback.print_exc(); 
+        print("---------------------------\n")
 
