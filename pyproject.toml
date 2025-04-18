@@ -1,11 +1,31 @@
+
+[build-system]
+requires = ["setuptools >= 61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "python-agent-sandbox"
-version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
-requires-python = ">=3.12"
+version = "0.3.0" # Match your latest app version or set as desired
+description = "API service for executing code in sandboxed environments."
+requires-python = ">=3.12" # Specify your minimum Python version
 dependencies = [
+    "fastapi>=0.115.12", # Use specific or range constraints
+    "uvicorn[standard]>=0.34.1", # Include standard extras for performance
     "docker>=7.1.0",
-    "fastapi[all]>=0.115.12",
-    "uvicorn>=0.34.1",
+    "pydantic>=2.10.0",
+    "requests>=2.28.0", # For test_api.py if used outside TestClient, good to list explicit deps
+    # Add other core dependencies here if any
 ]
+
+[project.optional-dependencies]
+# Define dependencies needed only for testing under the "test" group
+test = [
+    "pytest>=7.4.3",
+    "httpx>=0.24.0", # Required by FastAPI's TestClient
+    # Add other test-specific dependencies here (e.g., Pillow for image validation)
+]
+
+# Optional: Configure pytest via pyproject.toml
+# [tool.pytest.ini_options]
+# pythonpath = ["src"] # Helps pytest find modules in src
+# addopts = "-v"      # Default options for pytest command
