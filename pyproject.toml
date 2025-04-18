@@ -25,7 +25,8 @@ test = [
     # Add other test-specific dependencies here (e.g., Pillow for image validation)
 ]
 
-# Optional: Configure pytest via pyproject.toml
-# [tool.pytest.ini_options]
-# pythonpath = ["src"] # Helps pytest find modules in src
+# Configure pytest
+[tool.pytest.ini_options]
+# Tell pytest to add 'src' to the Python path so it can find the modules
+pythonpath = ["src"]
 # addopts = "-v"      # Default options for pytest command
