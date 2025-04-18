@@ -1,247 +1,363 @@
-# src/api/files.py - API Router for File System Operations
-# Updated: Changed PurePosixPath to Path to allow use of .resolve()
+# tests/test_api.py - Pytest tests for the execution API
+# Updated: Reformatted long single-line tests for readability
 
-import logging
-import shlex
-# Use Path instead of PurePosixPath for resolve() method
+import pytest
+from fastapi.testclient import TestClient
+import os
+import uuid
+import sys
 from pathlib import Path
+import shlex # Import needed for test_create_directory fix
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Body, status
+# Use absolute imports starting from the 'src' directory
+from src.main import app
+from src.core.docker_runner import docker_client, get_session_volume_name, SESSION_VOLUME_PREFIX
+from src.models.execution import PythonCode, ShellCommand, ShellResult, PythonScript
+from docker.errors import NotFound
 
-# Import models and helpers
-from src.models.files import (
-    FileListResponse, FileEntry, FileContentResponse, FileWriteRequest
-)
-from src.core.docker_runner import run_in_container, WORKSPACE_DIR_INSIDE_CONTAINER
+# Create a TestClient instance
+client = TestClient(app)
 
-logger = logging.getLogger(__name__)
+# --- Test Data ---
+SIMPLE_PLOT_CODE = """
+import matplotlib.pyplot as plt
+print("--- Plotting Test ---")
+plt.plot([10, 20, 5, 15])
+plt.title("Simple Test Plot")
+print("--- Plotting Done ---")
+"""
+PYTHON_ERROR_CODE = """
+print("--- Error Test ---")
+x = 1 / 0
+print("--- This won't print ---")
+"""
+PYTHON_SCRIPT_SUCCESS = """
+import sys
+import os
+print("Hello from Python script!")
+print("Current working directory:", os.getcwd(), flush=True)
+print("Arguments:", sys.argv)
+print("Test data on stderr", file=sys.stderr)
+"""
+PYTHON_SCRIPT_FAILURE = """
+import sys
+print("About to exit with status 5", file=sys.stderr)
+sys.exit(5)
+"""
 
-# Create an API router
-router = APIRouter(
-    prefix="/sessions/{session_id}/files", # Prefix for all routes in this file
-    tags=["File System"], # Tag for OpenAPI documentation
-)
-
-# --- Path Validation Helper ---
-# Changed return type hint to Path
-def validate_and_resolve_path(session_id: str, user_path: str) -> Path:
-    """
-    Validates a user-provided path and resolves it relative to the workspace root.
-    Prevents path traversal attacks.
-
-    Args:
-        session_id: The session ID (used for logging).
-        user_path: The path provided by the user (e.g., from query param).
-
-    Returns:
-        A Path object representing the absolute path inside the container's workspace.
-
-    Raises:
-        HTTPException: If the path is invalid or attempts to escape the workspace.
-    """
-    if not user_path:
-        user_path = "." # Default to current directory if empty
-
-    # Use Path which has the .resolve() method
-    base_workspace = Path(WORKSPACE_DIR_INSIDE_CONTAINER)
+# --- Fixtures ---
+@pytest.fixture(scope="session", autouse=True)
+def cleanup_test_volumes():
+    """Pytest fixture to automatically clean up test volumes after tests run."""
+    yield
+    print("\nCleaning up test Docker volumes...")
+    if not docker_client: print("Warning: Docker client not available for volume cleanup."); return
     try:
-        # Treat user_path as relative *within* the workspace
-        # Use Path object for joining and resolving
-        absolute_requested_path = (base_workspace / user_path).resolve()
+        test_volume_prefix = f"{SESSION_VOLUME_PREFIX}test-session-"
+        volumes = docker_client.volumes.list(filters={'name': test_volume_prefix})
+        count = 0
+        for volume in volumes:
+            try: print(f"Removing test volume: {volume.name}"); volume.remove(force=True); count += 1
+            except Exception as e: print(f"Error removing volume {volume.name}: {e}")
+        print(f"Removed {count} test volumes matching prefix '{test_volume_prefix}*'.")
+    except Exception as e: print(f"Error listing/cleaning test volumes: {e}")
 
-        # Check if the resolved path is still within the workspace directory
-        if base_workspace not in absolute_requested_path.parents and absolute_requested_path != base_workspace:
-             logger.warning(f"Path traversal attempt denied for session '{session_id}': User path '{user_path}' resolved outside workspace to '{absolute_requested_path}'")
-             raise HTTPException(
-                 status_code=status.HTTP_400_BAD_REQUEST,
-                 detail=f"Invalid path: Access denied outside workspace for path '{user_path}'."
-             )
+# --- Test Functions ---
+def test_health_check():
+    response = client.get("/health")
+    assert response.status_code == 200
+    json_response = response.json()
+    assert json_response["status"] == "ok"
+    assert "docker_status" in json_response
 
-        logger.debug(f"Resolved path for session '{session_id}': '{user_path}' -> '{absolute_requested_path}'")
-        return absolute_requested_path
+# --- Shell Execution Tests (Reformatted) ---
+def test_execute_shell_success():
+    session_id = f"test-session-shell-success-{uuid.uuid4()}"
+    command = "echo 'Success!' && exit 0"
+    response = client.post("/execute/shell", json={"session_id": session_id, "command": command})
+    assert response.status_code == 200
+    json_response = response.json()
+    assert json_response["stdout"] == "Success!\n"
+    assert json_response["stderr"] == ""
+    assert json_response["exit_code"] == 0
 
-    except Exception as e: # Catch potential errors during path resolution
-        logger.error(f"Error resolving path for session '{session_id}', user path '{user_path}': {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid path format or resolution error for '{user_path}'."
-        )
+def test_execute_shell_failure_exit_code():
+    session_id = f"test-session-shell-fail-{uuid.uuid4()}"
+    command = "echo 'Error output' >&2 && exit 5"
+    response = client.post("/execute/shell", json={"session_id": session_id, "command": command})
+    assert response.status_code == 200
+    json_response = response.json()
+    assert json_response["stdout"] == ""
+    assert "Error output" in json_response["stderr"]
+    assert json_response["exit_code"] == 5
 
-# --- API Endpoints ---
-# (Endpoint implementations remain the same, but now use the corrected helper)
+def test_execute_shell_command_not_found():
+    session_id = f"test-session-shell-notfound-{uuid.uuid4()}"
+    command = "this_command_does_not_exist_hopefully"
+    response = client.post("/execute/shell", json={"session_id": session_id, "command": command})
+    assert response.status_code == 200
+    json_response = response.json()
+    assert json_response["stdout"] == ""
+    assert "not found" in json_response["stderr"]
+    assert json_response["exit_code"] != 0
 
-@router.get(
-    "",
-    response_model=FileListResponse,
-    summary="List directory contents",
-    description=f"Lists files and subdirectories within the specified path relative to the session workspace ({WORKSPACE_DIR_INSIDE_CONTAINER}). Defaults to the workspace root."
-)
-async def list_directory(
-    session_id: str,
-    path: str = Query(".", description=f"Directory path relative to the workspace root ({WORKSPACE_DIR_INSIDE_CONTAINER}). Defaults to '.' (workspace root).")
-):
-    """Lists files and directories within the session workspace."""
-    resolved_path = validate_and_resolve_path(session_id, path)
-    command = f"cd {shlex.quote(str(resolved_path))} && ls -pA --full-time"
-    shell_command_list = ["bash", "-c", f"set -e; set -o pipefail; {command}"]
-    try:
-        exit_code, stdout_str, stderr_str = await run_in_container(
-            command=shell_command_list, session_id=session_id, working_dir=WORKSPACE_DIR_INSIDE_CONTAINER, network_mode="none"
-        )
-        if exit_code != 0:
-            logger.warning(f"List Directory failed for session '{session_id}', path '{path}'. Exit: {exit_code}, Stderr: {stderr_str}")
-            if "No such file or directory" in stderr_str: raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Path not found: '{path}'")
-            elif "Permission denied" in stderr_str: raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Permission denied for path: '{path}'")
-            else: raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to list directory. Exit: {exit_code}, Stderr: {stderr_str}")
-        entries = []
-        lines = stdout_str.strip().splitlines()
-        for line in lines:
-             if not line: continue
-             if line.endswith('/'): entry_name = line[:-1]; entry_type = 'directory'
-             else: entry_name = line; entry_type = 'file'
-             if entry_name in ['.', '..']: continue
-             entries.append(FileEntry(name=entry_name, type=entry_type))
-        # Return path relative to workspace for user clarity
-        # Use Path object's relative_to method
-        relative_path = str(resolved_path.relative_to(Path(WORKSPACE_DIR_INSIDE_CONTAINER)))
-        return FileListResponse(path=relative_path, entries=entries)
-    except HTTPException: raise
-    except Exception as e:
-        logger.error(f"Unexpected error listing directory for session '{session_id}', path '{path}': {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="An unexpected server error occurred while listing directory.")
+def test_execute_shell_persistence():
+    session_id = f"test-session-persistence-{uuid.uuid4()}"
+    filename = "persist_test.txt"
+    file_content = f"Data for {session_id}"
+    # Write using echo -n
+    write_command = f"echo -n '{file_content}' > {filename}"
+    response_write = client.post("/execute/shell", json={"session_id": session_id, "command": write_command})
+    assert response_write.status_code == 200
+    assert response_write.json()["exit_code"] == 0
+    # Read using cat
+    read_command = f"cat {filename}"
+    response_read = client.post("/execute/shell", json={"session_id": session_id, "command": read_command})
+    assert response_read.status_code == 200
+    json_read = response_read.json()
+    assert json_read["exit_code"] == 0
+    assert json_read["stdout"] == file_content # Compare exact content
+    assert json_read["stderr"] == ""
+    # Try reading in different session
+    other_session_id = f"test-session-other-{uuid.uuid4()}"
+    response_other = client.post("/execute/shell", json={"session_id": other_session_id, "command": read_command})
+    assert response_other.status_code == 200
+    json_other = response_other.json()
+    assert json_other["exit_code"] != 0
+    assert "No such file or directory" in json_other["stderr"]
+    # Verify volume exists (optional check)
+    if docker_client:
+        volume_name = get_session_volume_name(session_id)
+        volume_exists = False
+        try:
+            docker_client.volumes.get(volume_name)
+            volume_exists = True
+        except NotFound:
+            volume_exists = False
+        assert volume_exists is True
 
-@router.get(
-    "/content",
-    response_model=FileContentResponse,
-    summary="Read file content",
-    description=f"Reads the content of the specified file relative to the session workspace ({WORKSPACE_DIR_INSIDE_CONTAINER})."
-)
-async def read_file(
-    session_id: str,
-    path: str = Query(..., description=f"File path relative to the workspace root ({WORKSPACE_DIR_INSIDE_CONTAINER}).")
-):
-    """Reads content of a file within the session workspace."""
-    resolved_path = validate_and_resolve_path(session_id, path)
-    command = f"cat -- {shlex.quote(str(resolved_path))}"
-    shell_command_list = ["bash", "-c", f"set -e; set -o pipefail; {command}"]
-    try:
-        exit_code, stdout_str, stderr_str = await run_in_container(
-            command=shell_command_list, session_id=session_id, working_dir=WORKSPACE_DIR_INSIDE_CONTAINER, network_mode="none"
-        )
-        if exit_code != 0:
-            logger.warning(f"Read File failed for session '{session_id}', path '{path}'. Exit: {exit_code}, Stderr: {stderr_str}")
-            if "No such file or directory" in stderr_str: raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"File not found: '{path}'")
-            elif "Is a directory" in stderr_str: raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Path is a directory, not a file: '{path}'")
-            elif "Permission denied" in stderr_str: raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Permission denied for file: '{path}'")
-            else: raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to read file. Exit: {exit_code}, Stderr: {stderr_str}")
-        # Use Path object's relative_to method
-        relative_path = str(resolved_path.relative_to(Path(WORKSPACE_DIR_INSIDE_CONTAINER)))
-        return FileContentResponse(path=relative_path, content=stdout_str)
-    except HTTPException: raise
-    except Exception as e:
-        logger.error(f"Unexpected error reading file for session '{session_id}', path '{path}': {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="An unexpected server error occurred while reading file.")
+def test_execute_shell_missing_session_id():
+    response = client.post("/execute/shell", json={"command": "echo test"})
+    assert response.status_code == 422
 
-@router.put(
-    "/content",
-    status_code=status.HTTP_204_NO_CONTENT,
-    summary="Write file content",
-    description=f"Writes (or overwrites) the content of the specified file relative to the session workspace ({WORKSPACE_DIR_INSIDE_CONTAINER}). Creates parent directories if needed."
-)
-async def write_file(
-    session_id: str,
-    payload: FileWriteRequest,
-    path: str = Query(..., description=f"File path relative to the workspace root ({WORKSPACE_DIR_INSIDE_CONTAINER}). Parent directories will be created.")
-):
-    """Writes content to a file within the session workspace."""
-    resolved_path = validate_and_resolve_path(session_id, path)
-    parent_dir = resolved_path.parent
-    mkdir_command = f"mkdir -p {shlex.quote(str(parent_dir))}"
-    mkdir_shell_command = ["bash", "-c", f"set -e; {mkdir_command}"]
-    write_command = f"printf '%s' {shlex.quote(payload.content)} > {shlex.quote(str(resolved_path))}"
-    write_shell_command = ["bash", "-c", f"set -e; {write_command}"]
-    try:
-        logger.info(f"Ensuring directory exists for session '{session_id}', path '{parent_dir}'")
-        exit_code_mkdir, _, stderr_mkdir = await run_in_container(
-            command=mkdir_shell_command, session_id=session_id, working_dir=WORKSPACE_DIR_INSIDE_CONTAINER, network_mode="none"
-        )
-        if exit_code_mkdir != 0:
-             logger.error(f"Write File: Failed to create parent directory '{parent_dir}' for session '{session_id}'. Exit: {exit_code_mkdir}, Stderr: {stderr_mkdir}")
-             raise HTTPException(status_code=500, detail=f"Failed to create parent directory. Stderr: {stderr_mkdir}")
-        logger.info(f"Writing file content for session '{session_id}', path '{resolved_path}'")
-        exit_code_write, _, stderr_write = await run_in_container(
-            command=write_shell_command, session_id=session_id, working_dir=WORKSPACE_DIR_INSIDE_CONTAINER, network_mode="none"
-        )
-        if exit_code_write != 0:
-            logger.error(f"Write File failed for session '{session_id}', path '{path}'. Exit: {exit_code_write}, Stderr: {stderr_write}")
-            if "Permission denied" in stderr_write: raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Permission denied writing to file: '{path}'")
-            elif "Is a directory" in stderr_write: raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Path is a directory, cannot write file: '{path}'")
-            else: raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to write file. Exit: {exit_code_write}, Stderr: {stderr_write}")
-        return None
-    except HTTPException: raise
-    except Exception as e:
-        logger.error(f"Unexpected error writing file for session '{session_id}', path '{path}': {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="An unexpected server error occurred while writing file.")
+def test_execute_shell_empty_command():
+    session_id = f"test-session-{uuid.uuid4()}"
+    response = client.post("/execute/shell", json={"session_id": session_id, "command": ""})
+    assert response.status_code == 422
 
-@router.delete(
-    "",
-    status_code=status.HTTP_204_NO_CONTENT,
-    summary="Delete file or directory",
-    description=f"Deletes the specified file or directory (recursively) relative to the session workspace ({WORKSPACE_DIR_INSIDE_CONTAINER})."
-)
-async def delete_path(
-    session_id: str,
-    path: str = Query(..., description=f"Path to the file or directory to delete, relative to the workspace root ({WORKSPACE_DIR_INSIDE_CONTAINER}).")
-):
-    """Deletes a file or directory within the session workspace."""
-    resolved_path = validate_and_resolve_path(session_id, path)
-    # Use Path object for comparison
-    if resolved_path == Path(WORKSPACE_DIR_INSIDE_CONTAINER):
-         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot delete the workspace root directory.")
-    command = f"rm -rf -- {shlex.quote(str(resolved_path))}"
-    shell_command_list = ["bash", "-c", f"set -e; {command}"]
-    try:
-        exit_code, _, stderr_str = await run_in_container(
-            command=shell_command_list, session_id=session_id, working_dir=WORKSPACE_DIR_INSIDE_CONTAINER, network_mode="none"
-        )
-        if exit_code != 0:
-            logger.warning(f"Delete Path failed for session '{session_id}', path '{path}'. Exit: {exit_code}, Stderr: {stderr_str}")
-            if "Permission denied" in stderr_str: raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Permission denied deleting path: '{path}'")
-            else: logger.warning(f"Delete command exited non-zero ({exit_code}) but may have partially succeeded or path didn't exist. Stderr: {stderr_str}")
-        return None
-    except HTTPException: raise
-    except Exception as e:
-        logger.error(f"Unexpected error deleting path for session '{session_id}', path '{path}': {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="An unexpected server error occurred while deleting path.")
+# --- Python Chart Execution Tests (Stateless) ---
+def test_execute_python_chart_success():
+    response = client.post("/execute/python/chart", json={"code": SIMPLE_PLOT_CODE})
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    assert len(response.content) > 100
 
-@router.post(
-    "/directories",
-    status_code=status.HTTP_201_CREATED,
-    summary="Create directory",
-    description=f"Creates a directory (including parent directories) at the specified path relative to the session workspace ({WORKSPACE_DIR_INSIDE_CONTAINER})."
-)
-async def create_directory(
-    session_id: str,
-    path: str = Query(..., description=f"Directory path to create, relative to the workspace root ({WORKSPACE_DIR_INSIDE_CONTAINER}).")
-):
-    """Creates a directory within the session workspace."""
-    resolved_path = validate_and_resolve_path(session_id, path)
-    command = f"mkdir -p -- {shlex.quote(str(resolved_path))}"
-    shell_command_list = ["bash", "-c", f"set -e; {command}"]
-    try:
-        exit_code, _, stderr_str = await run_in_container(
-            command=shell_command_list, session_id=session_id, working_dir=WORKSPACE_DIR_INSIDE_CONTAINER, network_mode="none"
-        )
-        if exit_code != 0:
-            logger.error(f"Create Directory failed for session '{session_id}', path '{path}'. Exit: {exit_code}, Stderr: {stderr_str}")
-            if "Permission denied" in stderr_str: raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Permission denied creating directory: '{path}'")
-            elif "File exists" in stderr_str: raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Path already exists and is not a directory: '{path}'")
-            else: raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to create directory. Exit: {exit_code}, Stderr: {stderr_str}")
-        # Use Path object's relative_to method
-        relative_path = str(resolved_path.relative_to(Path(WORKSPACE_DIR_INSIDE_CONTAINER)))
-        return {"message": "Directory created successfully", "path": relative_path}
-    except HTTPException: raise
-    except Exception as e:
-        logger.error(f"Unexpected error creating directory for session '{session_id}', path '{path}': {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="An unexpected server error occurred while creating directory.")
+def test_execute_python_chart_code_error():
+    response = client.post("/execute/python/chart", json={"code": PYTHON_ERROR_CODE})
+    assert response.status_code == 400
+    json_response = response.json()
+    assert "detail" in json_response
+    assert "Python script execution failed" in json_response["detail"]
+    assert "Exit Code: 1" in json_response["detail"]
+    assert "division by zero" in json_response["detail"]
+
+def test_execute_python_chart_no_plot():
+    code_no_plot = "print('This script does nothing visual.')\nx = 1 + 1"
+    response = client.post("/execute/python/chart", json={"code": code_no_plot})
+    assert response.status_code == 500
+    json_response = response.json()
+    assert "detail" in json_response
+    assert "failed to produce the expected output file" in json_response["detail"]
+
+def test_execute_python_chart_missing_code():
+    response = client.post("/execute/python/chart", json={})
+    assert response.status_code == 422
+
+# --- Python Script Execution Tests (Stateful) ---
+def test_execute_python_script_success():
+    session_id = f"test-session-py-success-{uuid.uuid4()}"
+    response = client.post("/execute/python/script", json={"session_id": session_id, "code": PYTHON_SCRIPT_SUCCESS})
+    assert response.status_code == 200
+    json_response = response.json()
+    assert "Hello from Python script!" in json_response["stdout"]
+    assert "Current working directory: /workspace" in json_response["stdout"]
+    assert "Test data on stderr" in json_response["stderr"]
+    assert json_response["exit_code"] == 0
+
+def test_execute_python_script_failure():
+    session_id = f"test-session-py-fail-{uuid.uuid4()}"
+    response = client.post("/execute/python/script", json={"session_id": session_id, "code": PYTHON_SCRIPT_FAILURE})
+    assert response.status_code == 200
+    json_response = response.json()
+    assert json_response["stdout"] == ""
+    assert "About to exit with status 5" in json_response["stderr"]
+    assert json_response["exit_code"] == 5
+
+def test_execute_python_script_runtime_error():
+    session_id = f"test-session-py-runtimeerror-{uuid.uuid4()}"
+    response = client.post("/execute/python/script", json={"session_id": session_id, "code": PYTHON_ERROR_CODE})
+    assert response.status_code == 200
+    json_response = response.json()
+    assert "Error Test" in json_response["stdout"]
+    assert "Traceback" in json_response["stderr"]
+    assert "ZeroDivisionError" in json_response["stderr"]
+    assert json_response["exit_code"] != 0
+
+def test_execute_python_script_persistence():
+    session_id = f"test-session-py-persistence-{uuid.uuid4()}"
+    filename = "py_persist_test.txt"
+    file_content = f"Data from Python script for {session_id}"
+    write_code = f"print('Writing file...')\nwith open('{filename}', 'w') as f:\n    f.write('{file_content}')\nprint('Write complete.')"
+    response_write = client.post("/execute/python/script", json={"session_id": session_id, "code": write_code})
+    assert response_write.status_code == 200
+    assert response_write.json()["exit_code"] == 0
+    assert "Write complete." in response_write.json()["stdout"]
+    read_command = f"cat {filename}"
+    response_read = client.post("/execute/shell", json={"session_id": session_id, "command": read_command})
+    assert response_read.status_code == 200
+    json_read = response_read.json()
+    assert json_read["exit_code"] == 0
+    assert json_read["stdout"] == file_content
+    assert json_read["stderr"] == ""
+
+def test_execute_python_script_missing_session_id():
+    response = client.post("/execute/python/script", json={"code": "print('hello')"})
+    assert response.status_code == 422
+
+def test_execute_python_script_empty_code():
+    session_id = f"test-session-{uuid.uuid4()}"
+    response = client.post("/execute/python/script", json={"session_id": session_id, "code": ""})
+    assert response.status_code == 422
+
+# --- File System API Tests (Reformatted) ---
+@pytest.fixture
+def file_api_session_id():
+    return f"test-session-files-{uuid.uuid4()}"
+
+def test_create_directory(file_api_session_id):
+    session_id = file_api_session_id
+    dir_to_create = "test_dir"
+    subdir_to_create = f"{dir_to_create}/subdir"
+    # Create nested directory
+    response = client.post(f"/sessions/{session_id}/files/directories?path={subdir_to_create}")
+    assert response.status_code == 201
+    assert response.json()["path"] == subdir_to_create
+    # Verify using ls on parent
+    parent_dir_path = str(Path(subdir_to_create).parent)
+    response_ls = client.post("/execute/shell", json={"session_id": session_id, "command": f"ls -AF {shlex.quote(parent_dir_path)}"})
+    assert response_ls.status_code == 200
+    ls_json = response_ls.json()
+    assert ls_json["exit_code"] == 0
+    assert "subdir/" in ls_json["stdout"].splitlines()
+
+def test_write_file(file_api_session_id):
+    session_id = file_api_session_id
+    file_path = "my_new_file.txt"
+    file_content = "Hello from the file API!\nLine 2."
+    response = client.put(
+        f"/sessions/{session_id}/files/content?path={file_path}",
+        json={"content": file_content}
+    )
+    assert response.status_code == 204
+
+def test_read_file(file_api_session_id):
+    session_id = file_api_session_id
+    file_path = "read_test.txt"
+    file_content = f"Content for read test - {session_id}"
+    # Write first
+    write_response = client.put(f"/sessions/{session_id}/files/content?path={file_path}", json={"content": file_content})
+    assert write_response.status_code == 204
+    # Read back
+    read_response = client.get(f"/sessions/{session_id}/files/content?path={file_path}")
+    assert read_response.status_code == 200
+    json_response = read_response.json()
+    assert json_response["path"] == file_path
+    assert json_response["content"] == file_content
+
+def test_read_nonexistent_file(file_api_session_id):
+    session_id = file_api_session_id
+    file_path = "nonexistent_file.txt"
+    response = client.get(f"/sessions/{session_id}/files/content?path={file_path}")
+    assert response.status_code == 404
+    assert "File not found" in response.json()["detail"]
+
+def test_list_directory(file_api_session_id):
+    session_id = file_api_session_id
+    dir_path = "list_test_dir"
+    file1 = f"{dir_path}/file1.txt"
+    file2 = f"{dir_path}/file2.log"
+    subdir = f"{dir_path}/sub"
+    # Create items
+    response_mkdir = client.post(f"/sessions/{session_id}/files/directories?path={subdir}")
+    assert response_mkdir.status_code == 201
+    response_write1 = client.put(f"/sessions/{session_id}/files/content?path={file1}", json={"content": "f1"})
+    assert response_write1.status_code == 204
+    response_write2 = client.put(f"/sessions/{session_id}/files/content?path={file2}", json={"content": "f2"})
+    assert response_write2.status_code == 204
+    # List directory
+    response = client.get(f"/sessions/{session_id}/files?path={dir_path}")
+    assert response.status_code == 200
+    json_response = response.json()
+    assert json_response["path"] == dir_path
+    entries = {entry["name"]: entry["type"] for entry in json_response["entries"]}
+    assert len(entries) == 3
+    assert entries.get("file1.txt") == "file"
+    assert entries.get("file2.log") == "file"
+    assert entries.get("sub") == "directory"
+
+def test_list_root_directory(file_api_session_id):
+    session_id = file_api_session_id
+    response_write = client.put(f"/sessions/{session_id}/files/content?path=root_file.txt", json={"content": "root"})
+    assert response_write.status_code == 204
+    response = client.get(f"/sessions/{session_id}/files?path=.")
+    assert response.status_code == 200
+    json_response = response.json()
+    assert json_response["path"] == "."
+    entries = {entry["name"]: entry["type"] for entry in json_response["entries"]}
+    assert "root_file.txt" in entries
+    assert entries["root_file.txt"] == "file"
+
+def test_delete_file(file_api_session_id):
+    session_id = file_api_session_id
+    file_path = "file_to_delete.txt"
+    write_resp = client.put(f"/sessions/{session_id}/files/content?path={file_path}", json={"content": "delete me"})
+    assert write_resp.status_code == 204
+    delete_resp = client.delete(f"/sessions/{session_id}/files?path={file_path}")
+    assert delete_resp.status_code == 204
+    read_resp = client.get(f"/sessions/{session_id}/files/content?path={file_path}")
+    assert read_resp.status_code == 404
+
+def test_delete_directory(file_api_session_id):
+    session_id = file_api_session_id
+    dir_path = "dir_to_delete"
+    file_in_dir = f"{dir_path}/some_file.txt"
+    response_mkdir = client.post(f"/sessions/{session_id}/files/directories?path={dir_path}")
+    assert response_mkdir.status_code == 201
+    response_write = client.put(f"/sessions/{session_id}/files/content?path={file_in_dir}", json={"content": "in dir"})
+    assert response_write.status_code == 204
+    delete_resp = client.delete(f"/sessions/{session_id}/files?path={dir_path}")
+    assert delete_resp.status_code == 204
+    list_resp = client.get(f"/sessions/{session_id}/files?path={dir_path}")
+    assert list_resp.status_code == 404
+
+def test_path_traversal_prevention(file_api_session_id):
+    session_id = file_api_session_id
+    bad_paths = ["../outside.txt", "/etc/passwd", "/workspace/../etc/passwd", ".."]
+    for path in bad_paths:
+        print(f"Testing bad path: {path}")
+        response_list = client.get(f"/sessions/{session_id}/files?path={path}")
+        assert response_list.status_code == 400
+        assert "Invalid path" in response_list.json()["detail"]
+        response_read = client.get(f"/sessions/{session_id}/files/content?path={path}")
+        assert response_read.status_code == 400
+        assert "Invalid path" in response_read.json()["detail"]
+        response_write = client.put(f"/sessions/{session_id}/files/content?path={path}", json={"content": "bad"})
+        assert response_write.status_code == 400
+        assert "Invalid path" in response_write.json()["detail"]
+        response_delete = client.delete(f"/sessions/{session_id}/files?path={path}")
+        assert response_delete.status_code == 400
+        assert "Invalid path" in response_delete.json()["detail"]
+        response_mkdir = client.post(f"/sessions/{session_id}/files/directories?path={path}")
+        assert response_mkdir.status_code == 400
+        assert "Invalid path" in response_mkdir.json()["detail"]
 

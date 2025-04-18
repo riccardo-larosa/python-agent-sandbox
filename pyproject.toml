@@ -1,32 +1,35 @@
-
 [build-system]
 requires = ["setuptools >= 61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "python-agent-sandbox"
-version = "0.3.0" # Match your latest app version or set as desired
+version = "0.5.0" # Match your latest app version or set as desired
 description = "API service for executing code in sandboxed environments."
 requires-python = ">=3.12" # Specify your minimum Python version
 dependencies = [
-    "fastapi>=0.115.12", # Use specific or range constraints
-    "uvicorn[standard]>=0.34.1", # Include standard extras for performance
+    "fastapi>=0.115.12",
+    "uvicorn[standard]>=0.34.1",
     "docker>=7.1.0",
     "pydantic>=2.10.0",
-    "requests>=2.28.0", # For test_api.py if used outside TestClient, good to list explicit deps
+    "requests>=2.28.0",
     # Add other core dependencies here if any
 ]
 
 [project.optional-dependencies]
-# Define dependencies needed only for testing under the "test" group
 test = [
     "pytest>=7.4.3",
-    "httpx>=0.24.0", # Required by FastAPI's TestClient
-    # Add other test-specific dependencies here (e.g., Pillow for image validation)
+    "httpx>=0.24.0",
+    "pytest-asyncio" # Explicitly add pytest-asyncio if needed by mode setting
 ]
 
 # Configure pytest
 [tool.pytest.ini_options]
 # Tell pytest to add 'src' to the Python path so it can find the modules
 pythonpath = ["src"]
-# addopts = "-v"      # Default options for pytest command
+# Explicitly set the asyncio mode for compatibility with FastAPI/anyio
+# Use "auto" to automatically detect or "strict" if needed
+asyncio_mode = "auto"
+# Optional: Add default command line options
+# addopts = "-v"
+
