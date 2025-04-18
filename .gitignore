@@ -13,3 +13,6 @@ wheels/
 
 # pytest
 .pytest_cache
+
+# config
+.env

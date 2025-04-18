@@ -1,7 +1,8 @@
 # src/models/execution.py - Pydantic models for API requests and responses
-# Updated: Added PythonScript model
+# Updated: Added optional environment dictionary
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from typing import Optional, Dict, List # Import Dict and Optional
 import re
 
 # --- Utility for Sanitization ---
@@ -20,12 +21,15 @@ class ShellCommand(BaseModel):
     """Model for executing a shell command within a specific session."""
     session_id: str = Field(..., description="Identifier for the persistent session workspace.")
     command: str = Field(..., description="Shell command string to execute.")
+    # Optional environment variables for the command execution
+    environment: Optional[Dict[str, str]] = Field(None, description="Environment variables to set for the command.")
 
-# New model for general Python script execution
 class PythonScript(BaseModel):
     """Model for executing a general Python script within a specific session."""
     session_id: str = Field(..., description="Identifier for the persistent session workspace.")
     code: str = Field(..., description="Python code string to execute.")
+    # Optional environment variables for the script execution
+    environment: Optional[Dict[str, str]] = Field(None, description="Environment variables to set for the script.")
 
 
 # --- Execution Result Models ---
@@ -35,6 +39,4 @@ class ShellResult(BaseModel):
     stdout: str
     stderr: str
     exit_code: int
-
-# ShellResult is suitable for Python script output as well.
 

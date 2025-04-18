@@ -13,13 +13,17 @@ dependencies = [
     "docker>=7.1.0",
     "pydantic>=2.10.0",
     "requests>=2.28.0",
+    "python-dotenv>=1.0.0", # For loading API keys from .env
+    "httpx>=0.24.0", # For making async/sync HTTP requests
+    "langchain-core>=0.1.50", # Core Langchain functionalities
+    "langchain-openai>=0.1.0", # For OpenAI models
+    "langchain>=0.1.0", # Main Langchain library
     # Add other core dependencies here if any
 ]
 
 [project.optional-dependencies]
 test = [
     "pytest>=7.4.3",
-    "httpx>=0.24.0",
     "pytest-asyncio" # Explicitly add pytest-asyncio if needed by mode setting
 ]
 
