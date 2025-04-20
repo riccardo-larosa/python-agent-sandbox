@@ -2,7 +2,7 @@
 # Updated: Added Playwright and browser dependencies
 
 # Use a slim Python base image
-FROM python:3.10-slim
+FROM python:3.12-slim
 
 # Set environment variable to skip interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
@@ -32,6 +32,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxtst6 \
     # Other dependencies
     xvfb \
+    xauth \
+    dbus \
     # Clean up apt cache
     && rm -rf /var/lib/apt/lists/*
 
@@ -43,7 +45,10 @@ RUN pip install --no-cache-dir \
     pandas \
     numpy \
     uv \
-    playwright==1.40.* # Pin playwright version for consistency if needed
+    browser-use \
+    langchain-openai \
+    python-dotenv
+    #playwright==1.40.* 
 
 # Install Playwright browsers (e.g., Chromium) and their OS dependencies
 # Using --with-deps helps ensure all necessary OS packages are present
